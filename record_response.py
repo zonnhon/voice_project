@@ -22,12 +22,14 @@ SYSTEM_PROMPT = (
     "回答要簡潔、口語、適合直接唸出來。"
 )
 
+# ===== Conversation history 設定 =====
+MAX_TURNS_IN_HISTORY = 10
 
 # ========= 設定區 =========
 SAMPLE_RATE = 16000          # WebRTC VAD 建議 8k/16k/32k/48k
 CHANNELS = 1
 FRAME_MS = 20                # WebRTC VAD 支援 10/20/30ms
-VAD_MODE = 2                 # 0~3 越大越嚴格（誤觸發更少，但可能漏）
+VAD_MODE = 3                 # 0~3 越大越嚴格（誤觸發更少，但可能漏）
 PRE_ROLL_MS = 300            # 開口前緩衝（避免切到第一個字）
 SILENCE_END_MS = 900         # 靜音多久視為一句話結束
 MIN_UTTERANCE_MS = 400       # 太短的片段不送（避免噪音誤觸發）
@@ -63,6 +65,27 @@ def ensure_env():
             "  export SPEECHES_BASE_URL='http://127.0.0.1:8000'\n"
             "或在程式中直接指定 SPEECHES_BASE_URL 常數。"
         )
+
+def trim_history(history: list[dict], max_turns: int = MAX_TURNS_IN_HISTORY) -> list[dict]:
+    """
+    history: [{"role":"user"/"assistant","content":"..."}, ...]
+    只保留最後 max_turns 輪對話（user+assistant 為一輪）。
+    """
+    max_msgs = max_turns * 2
+    if len(history) <= max_msgs:
+        return history
+    return history[-max_msgs:]
+
+
+def build_messages_with_history(user_text: str, history: list[dict]) -> list[dict]:
+    """
+    組出要送到 GPT 的 messages：
+    system + (history...) + current user
+    """
+    msgs = [{"role": "system", "content": SYSTEM_PROMPT}]
+    msgs.extend(history)
+    msgs.append({"role": "user", "content": user_text})
+    return msgs
 
 
 def pcm16_bytes_from_float32(x: np.ndarray) -> bytes:
@@ -127,11 +150,38 @@ def call_gpt_api(user_text: str) -> str:
     data = r.json()
     return data["choices"][0]["message"]["content"]
 
+def call_gpt_api(user_text: str, history: list[dict]) -> str:
+    """
+    OpenAI Chat Completions 相容 API + history
+    """
+    url = f"{GPT_API_BASE_URL}/chat/completions"
+
+    headers = {"Content-Type": "application/json"}
+    if GPT_API_KEY:
+        headers["Authorization"] = f"Bearer {GPT_API_KEY}"
+
+    messages = build_messages_with_history(user_text, history)
+
+    payload = {
+        "model": GPT_MODEL_ID,
+        "messages": messages,
+        "temperature": 0.4,
+    }
+
+    r = requests.post(url, headers=headers, json=payload, timeout=60)
+    r.raise_for_status()
+
+    data = r.json()
+    return data["choices"][0]["message"]["content"]
+
+
 
 def main():
     ensure_env()
     ensure_gpt_env()
     os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+    conversation_history: list[dict] = []
 
     vad = webrtcvad.Vad(VAD_MODE)
 
@@ -235,18 +285,44 @@ def main():
                     # else:
                     #     print("  transcription:", text)
 
+                    # text = resp.get("text")
+                    # if not text:
+                    #     print("  transcription:", json.dumps(resp, ensure_ascii=False))
+                    # else:
+                    #     print("  transcription:", text)
+
+                    #     # ===== 呼叫 GPT =====
+                    #     try:
+                    #         reply = call_gpt_api(text)
+                    #         print("🤖 GPT reply:", reply)
+                    #     except requests.RequestException as e:
+                    #         print("  GPT API error:", str(e))
+
+
                     text = resp.get("text")
                     if not text:
                         print("  transcription:", json.dumps(resp, ensure_ascii=False))
                     else:
                         print("  transcription:", text)
 
-                        # ===== 呼叫 GPT =====
+                        # ===== 呼叫 GPT（含歷史）=====
                         try:
-                            reply = call_gpt_api(text)
-                            print("🤖 GPT reply:", reply)
+                            # 先 trim，避免越長越慢
+                            conversation_history = trim_history(conversation_history)
+
+                            reply = call_gpt_api(text, conversation_history)
+                            print("🤖 Bot reply:", reply)
+
+                            # 把這輪對話寫回 history
+                            conversation_history.append({"role": "user", "content": text})
+                            conversation_history.append({"role": "assistant", "content": reply})
+
+                            # 再 trim 一次（保險）
+                            conversation_history = trim_history(conversation_history)
+
                         except requests.RequestException as e:
                             print("  GPT API error:", str(e))
+
                 except requests.RequestException as e:
                     print("  API error:", str(e))
 
